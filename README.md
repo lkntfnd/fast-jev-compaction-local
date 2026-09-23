@@ -55,6 +55,9 @@ built-in compaction summary with the original messages.
 
 Jev failures, malformed answers, a missing key, or a history that cannot be
 fitted throw; the caller (or the Claude Code hook) decides what to fall back to.
+When requests fail, the error is a `PartialCompactionError` whose `result`
+applies the answers that did come back (unanswered calls are kept), so a
+fallback can start from the partly pruned transcript.
 
 ## Install and usage
 
@@ -96,6 +99,48 @@ The building blocks (`collectToolCalls`, `fitState`, `batchCalls`,
 `apiKey` defaults to `process.env.TYPESAFE_API_KEY`. Never commit the key or
 put it in a source file.
 
+### Local classifier (LM Studio)
+
+`LocalJevAsker` answers the same questions with a local Jev-style decision
+model, [`chaoliangUNSW/Jev-Style-Qwen3.5-2B-Decision-MLX-bf16`](https://huggingface.co/chaoliangUNSW/Jev-Style-Qwen3.5-2B-Decision-MLX-bf16),
+served by LM Studio. No key is needed and nothing leaves the configured URL.
+
+```ts
+import { compact, fetchText, LocalJevAsker } from 'fast-jev-compaction';
+
+const asker = new LocalJevAsker({ fetch: fetchText }); // http://127.0.0.1:1234/v1
+const result = await compact(transcript, asker, { preserveRecentMessages: 4 });
+```
+
+Every `noul` question becomes one prompt in the model's own format (`[State]`,
+`[Question]`, `[Options]` `A. yes` / `B. no`, ending in `Answer:`), sent to
+`/chat/completions` with `temperature: 0`, `max_tokens: 2` (LM Studio returns
+nothing for 1) and `top_logprobs: 10`. The `noul` is the log-prob of option A
+renormalised over A and B; a letter outside the returned candidates gets the
+lowest returned log-prob minus 5, as in the model's reference client. The model
+never writes text, so `keepThreshold` keeps its meaning.
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `fetch` | (required) | `fetchText` (global `fetch`) or a host transport |
+| `baseUrl` | `http://127.0.0.1:1234/v1` | OpenAI-compatible base URL |
+| `model` | `jev-style-qwen3.5-2b-decision-mlx` | Model identifier as LM Studio lists it |
+| `concurrency` | `2` | Decisions in flight at once, across every `ask` |
+| `contextTokens` | `64000` | Estimated ceiling for one prompt; keep it under the loaded context |
+
+`asker.decide(state, question, options)` answers one question among 2 to 10
+mutually exclusive options with the renormalised probability of each and the
+most probable `choice`; the Claude Code plugin exposes it to every agent as the
+`classify` tool (see [`hooks/README.md`](hooks/README.md)). Pass one
+`createScheduler(n)` as `scheduler` to several askers to cap their requests
+together.
+
+A prompt over `contextTokens`, an unreachable server, an HTTP error, a response
+without log-probs or without any option letter all throw; there is no fallback
+to the remote API. The full state is sent once per question, not once per
+batch, and LM Studio does not reuse the shared state prefix for this model, so
+a local compaction costs one state prefill per question.
+
 ## Options
 
 | Option | Default | Description |
@@ -130,7 +175,8 @@ stage was needed, and the number of requests.
 The repository root is a Claude Code function-hook plugin: `hooks/fast-jev.ts`
 is a thin adapter that feeds `session.compact` transcripts through `src/` and
 falls back to Claude Code's built-in summary on errors or insufficient
-reduction. See [`hooks/README.md`](hooks/README.md) for configuration and the
+reduction. The `backend` option picks the classifier: `local` (the default,
+LM Studio, no key) or `remote` (TypeSafe Jev, needs `TYPESAFE_API_KEY`). See [`hooks/README.md`](hooks/README.md) for configuration and the
 Claude Code 2.1.274 type reference.
 
 ### Install in Claude Code
@@ -150,13 +196,23 @@ claude plugin marketplace add tamaratran/fast-jev-compaction
 claude plugin install fast-jev-compaction@fast-jev-compaction
 ```
 
-The install prompts for the plugin options (API key, thresholds, `truncateHeadChars`,
-…); leave them at their defaults to use `TYPESAFE_API_KEY` from the environment.
+The install prompts for the plugin options (backend, API key, thresholds,
+`truncateHeadChars`, …); leave them at their defaults to use the local
+LM Studio classifier, or set `backend` to `remote` to use `TYPESAFE_API_KEY`
+from the environment.
 Restart Claude Code or run `/reload-plugins`. From then on `/compact` (and
 auto-compaction) goes through Jev: the toast reads
 `fast-jev-compaction: kept N/M messages, no summary (…)` when the pruned history
-replaced the built-in summary, or `fallback to built-in summary (…)` when Jev
-could not remove enough (short sessions, or when it fails).
+replaced the built-in summary, or `built-in summary over N/M pre-compacted
+messages (…)` when Jev could not remove enough (short sessions) or failed
+midway: the built-in summary then runs over the transcript already pruned by
+the decisions that came back. `turn.complete` asks for compaction once the
+context reaches `compactAtPercent` (default 50%).
+
+With the local backend the classification runs in the background once the
+context reaches `compactAtPercent`, and the compaction follows a turn or two
+later, so no hook waits on the model past Claude Code's 10-second hook budget
+(see [`hooks/README.md`](hooks/README.md)).
 
 To run from a checkout without installing: `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir .`
 from the repository root. No publishing step is required; the marketplace is
@@ -173,7 +229,7 @@ npm run validate:plugin  # claude plugin validate
 TYPESAFE_API_KEY="$(cat ~/.typesafe_key)" npm run demo
 ```
 
-The unit tests use a fake Jev and never contact TypeSafe. The demo is the live
+The unit tests use a fake Jev and a fake LM Studio and never contact either. The demo is the live
 network check.
 
 ## Animated demo (macOS)

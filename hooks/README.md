@@ -6,7 +6,9 @@ needed. `hooks/fast-jev.ts` is a thin adapter: it reads the plugin options,
 finds the TypeSafe key, hands `session.compact` transcripts to the
 `fast-jev-compaction` library in `src/` (the plugin folder is the repository
 root, so the hook imports it directly) and maps the result back onto session
-messages. User and assistant text is never touched. Jev is sent the whole
+messages. With `backend` set to `local` (the default) the questions go to the
+Jev-style decision model in LM Studio at `localBaseUrl` and no key is needed;
+with `remote` they go to TypeSafe. User and assistant text is never touched. Jev is sent the whole
 conversation as `state` (tool outputs replaced by a one-line note) and, for
 every tool call outside the pinned first and newest messages, two questions:
 whether the call should stay and whether its full output should stay. An
@@ -48,31 +50,103 @@ The plugin declares these `userConfig` values in
 
 | Option | Default |
 | --- | ---: |
+| `backend` | `local` |
 | `keepThreshold` | `0.5` |
 | `preserveRecentMessages` | `6` |
-| `compactAtPercent` | `60` |
+| `compactAtPercent` | `50` |
 | `minReductionRatio` | `0.25` |
 | `maxStateTokens` | `25000` |
 | `maxRequestTokens` | `30000` |
 | `truncateHeadChars` | `300` |
 | `model` | `jev-latest` |
+| `localBaseUrl` | `http://127.0.0.1:1234/v1` |
+| `localModel` | `jev-style-qwen3.5-2b-decision-mlx` |
+| `localConcurrency` | `2` |
+| `localContextTokens` | `64000` |
+| `classifyTool` | `true` |
+| `localDeadlineMs` | `7000` |
 
-The TypeSafe key can be supplied as the sensitive `apiKey` plugin option or
-through `TYPESAFE_API_KEY`. The environment variable is the recommended
-development setup.
+The TypeSafe key is only read for the `remote` backend. It can be supplied as
+the sensitive `apiKey` plugin option or through `TYPESAFE_API_KEY`. The
+environment variable is the recommended development setup.
 
-Every option except `apiKey`, `compactAtPercent`, `minReductionRatio` and
-`model` is passed straight to the library; see the root README for what they
+The `local` backend needs LM Studio serving the model with its context loaded
+at 64K (LM Studio reports 64380 tokens); `localContextTokens` stays a little
+under it. Each compaction logs one
+`classifier=local model=… endpoint=127.0.0.1:1234 concurrency=2` line, so the
+classifier in use is visible without logging any transcript content. When the
+local classifier fails, the hook falls back to Claude Code's built-in summary,
+never to TypeSafe.
+
+Every option except `backend`, `apiKey`, `compactAtPercent`,
+`minReductionRatio`, `model` and the `local*` options is passed straight to the library; see the root README for what they
 do. The `session.compact` hook runs the Jev requests concurrently. If Jev fails,
 the response is malformed, the key is unavailable, the history cannot be
 fitted into the state budget, or the estimated reduction is below
 `minReductionRatio`, the hook logs a fallback and delegates to Claude Code's
-built-in compaction. The outcome is shown as a toast and logged with the
+built-in compaction. The summarizer is handed the transcript already pruned
+by every decision that came back: all of them when only the reduction was too
+small, the ones answered before the failure when a request failed (calls
+without an answer stay verbatim). Only when nothing was decided does it get
+the original transcript. The outcome is shown as a toast and logged with the
 reduction, per-reason counts, state size and request count; a per-call
 `decisions:` line with both probabilities is logged for diagnosis. The
 `turn.complete` hook requests
 compaction when `context.percent` reaches `compactAtPercent`, with an
 in-flight guard.
+
+## The 10-second hook budget
+
+Claude Code gives a `session.compact`, `tool.call` or `turn.complete` hook
+10 seconds (time spent in `$.http.fetch` counts, time inside `next()` does
+not); a hook past it is dropped and the built-in compaction runs as if the
+plugin were not there. The local model needs seconds per question, so with
+the `local` backend nothing waits on it inside a hook for long:
+
+1. When the main conversation reaches `compactAtPercent`, `turn.complete`
+   takes `$.session.messages()` and starts classifying it in the background,
+   at low priority in the shared queue, and returns at once.
+2. Once every answer is in, the next main-loop `turn.complete` asks for the
+   compaction (not awaited, so a built-in summary never holds the hook).
+3. `session.compact` applies those answers to the transcript as it is now:
+   calls made since are kept, pinning is decided on the current transcript.
+   This takes milliseconds.
+4. A compaction without finished background answers (`/compact`, or Claude
+   Code's own threshold first) asks the model itself, for at most
+   `localDeadlineMs`; calls it did not reach are kept.
+5. A `classify` call gets the same `localDeadlineMs` and runs ahead of
+   background work in the queue; past it the agent gets a tool error.
+
+Checked in Claude Code 2.1.280's own hook engine (`claude plugin test`): a
+60-call compaction against a model answering in 800 ms per question returned
+at 7.0 s, a `classify` call against a 9.5 s server returned its error at
+7.0 s, and a compaction from background answers took 6 ms.
+
+## Subagents
+
+Only the main conversation compacts through the classifier. A subagent's
+`session.compact` (it carries `agentId`) goes straight to the built-in
+summary with one log line, and a subagent's `turn.complete` never triggers
+the `compactAtPercent` auto-compaction.
+
+## The `classify` tool
+
+With `classifyTool` on (the default), `session.start` registers a
+`classify` tool through `$.tool.register`; the engine names it
+`mcp__fast-jev-compaction__classify`, and a `tool.call` hook serves exactly
+the name it returned. Any agent can call it with `state` (the evidence),
+`question` and 2 to 10 mutually exclusive `options`; it answers
+`{"choice": …, "probabilities": {option: p, …}}`, renormalised over the options
+in their order. It always uses `localBaseUrl` and `localModel`, whatever
+`backend` is, and never contacts TypeSafe. Bad input and every classifier
+failure come back to the agent as the tool's error (`{ deny }`); the hook
+never throws. Each call logs one metadata line (option count, prompt tokens,
+latency, choice), never `state` or `question`.
+
+Every request to the local model, from compactions and `classify` calls
+alike, goes through one queue created in `register()`, so at most
+`localConcurrency` are in flight in total. A `classify` call made during a
+long compaction waits its turn behind the compaction's questions.
 
 ## Scope and caveat
 

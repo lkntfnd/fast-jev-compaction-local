@@ -1,13 +1,19 @@
 {
   "name": "fast-jev-compaction",
-  "version": "0.3.0",
-  "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
+  "version": "0.4.0",
+  "description": "Verbatim Jev-guided compaction for Claude Code sessions, with a local LM Studio classifier and a classify tool.",
   "license": "MIT",
   "userConfig": {
+    "backend": {
+      "type": "string",
+      "title": "Classifier backend",
+      "description": "local: the Jev-style decision model served by LM Studio (no key, nothing leaves localBaseUrl). remote: TypeSafe's Jev API (needs the TypeSafe key).",
+      "default": "local"
+    },
     "apiKey": {
       "type": "string",
       "title": "TypeSafe API key",
-      "description": "TypeSafe API key. Leave unset to use TYPESAFE_API_KEY.",
+      "description": "TypeSafe API key for the remote backend. Leave unset to use TYPESAFE_API_KEY.",
       "sensitive": true
     },
     "keepThreshold": {
@@ -25,8 +31,8 @@
     "compactAtPercent": {
       "type": "number",
       "title": "Compaction percentage",
-      "description": "Context percentage at which turn.complete requests compaction.",
-      "default": 60
+      "description": "Context percentage of the main conversation at which the plugin classifies it in the background (local backend) and then compacts it; subagents never trigger it.",
+      "default": 50
     },
     "minReductionRatio": {
       "type": "number",
@@ -55,8 +61,44 @@
     "model": {
       "type": "string",
       "title": "Jev model",
-      "description": "TypeSafe Jev model name.",
+      "description": "TypeSafe Jev model name (remote backend).",
       "default": "jev-latest"
+    },
+    "localBaseUrl": {
+      "type": "string",
+      "title": "Local classifier URL",
+      "description": "OpenAI-compatible base URL of the local classifier (local backend).",
+      "default": "http://127.0.0.1:1234/v1"
+    },
+    "localModel": {
+      "type": "string",
+      "title": "Local classifier model",
+      "description": "Model identifier of the local Jev-style decision model as LM Studio lists it (local backend).",
+      "default": "jev-style-qwen3.5-2b-decision-mlx"
+    },
+    "localConcurrency": {
+      "type": "number",
+      "title": "Local classifier concurrency",
+      "description": "Decision requests in flight at once against the local server (local backend).",
+      "default": 2
+    },
+    "localContextTokens": {
+      "type": "number",
+      "title": "Local classifier context tokens",
+      "description": "Estimated token ceiling for one local decision prompt; keep it under the context the model is loaded with (local backend).",
+      "default": 64000
+    },
+    "classifyTool": {
+      "type": "boolean",
+      "title": "Classify tool",
+      "description": "Registers the classify tool (mcp__<plugin>__classify) for every agent: a local decision classifier on localBaseUrl/localModel that returns calibrated probabilities. Never uses TypeSafe.",
+      "default": true
+    },
+    "localDeadlineMs": {
+      "type": "number",
+      "title": "Local classifier time budget (ms)",
+      "description": "Longest a hook waits on the local model before answering with what it has. Claude Code drops a hook that runs past 10 s, so keep it under 10000.",
+      "default": 7000
     }
   }
 }

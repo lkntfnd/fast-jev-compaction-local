@@ -1,3 +1,4 @@
+import type { LocalFetch } from './local.js';
 import { buildJevRequest, parseJevResponse } from './request.js';
 import type { JevAsker, JevQuestions, JevResponse, JevState } from './types.js';
 
@@ -41,3 +42,9 @@ export class JevClient implements JevAsker {
     return parseJevResponse(response.status, response.ok, await response.text());
   }
 }
+
+/** A `LocalFetch` over the global `fetch`, for `LocalJevAsker` outside a host. */
+export const fetchText: LocalFetch = async (url, init) => {
+  const response = await fetch(url, init);
+  return { status: response.status, ok: response.ok, text: await response.text() };
+};

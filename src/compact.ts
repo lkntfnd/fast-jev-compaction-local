@@ -1,4 +1,4 @@
-import { noulAnswer } from './request.js';
+import { noulAnswer, PartialAnswersError } from './request.js';
 import { collectToolCalls, estimateTokens, fitState } from './state.js';
 import type {
   CallAnswer,
@@ -114,6 +114,42 @@ export function decideCall(
   return { ...base, action: 'drop_call', reason: 'call_dropped' };
 }
 
+/**
+ * A compaction in which some requests failed. `result` applies only the
+ * answers that came back; every call without both answers keeps its default
+ * of 1, so nothing is dropped without a judgment.
+ */
+export class PartialCompactionError extends Error {
+  constructor(
+    message: string,
+    readonly result: CompactResult,
+  ) {
+    super(message);
+    this.name = 'PartialCompactionError';
+  }
+}
+
+function partialAnswers(
+  batch: readonly ToolCall[],
+  answers: PartialAnswersError['answers'],
+): Map<string, CallAnswer> {
+  const valid = (name: string): number | undefined => {
+    try {
+      return noulAnswer(answers, name);
+    } catch {
+      return undefined;
+    }
+  };
+  const partial = new Map<string, CallAnswer>();
+  for (const call of batch) {
+    const keepCall = valid(`call_${call.id}`);
+    const keepResult = valid(`result_${call.id}`);
+    if (keepCall === undefined && keepResult === undefined) continue;
+    partial.set(call.tool_use_id, { keepCall: keepCall ?? 1, keepResult: keepResult ?? 1 });
+  }
+  return partial;
+}
+
 async function askBatch(
   asker: JevAsker,
   state: CompactionState,
@@ -123,7 +159,7 @@ async function askBatch(
   const { answers } = await asker.ask(state, questions);
   return new Map(
     batch.map((call) => [
-      call.id,
+      call.tool_use_id,
       {
         keepCall: noulAnswer(answers, `call_${call.id}`),
         keepResult: noulAnswer(answers, `result_${call.id}`),
@@ -247,12 +283,118 @@ function count(decisions: readonly CallDecision[], reason: CallDecision['reason'
   return decisions.filter((decision) => decision.reason === reason).length;
 }
 
+/** What the classifier answered about a transcript's candidate calls. */
+export interface Classification {
+  /** Keep probabilities by `tool_use_id`; a call missing here is kept. */
+  answers: Map<string, CallAnswer>;
+  /** Requests that failed; their batches' answered questions are still in `answers`. */
+  failures: unknown[];
+  /** The asker stopped at its deadline before every question was answered. */
+  timedOut: boolean;
+  candidates: number;
+  stateTokens: number;
+  stateStage: string;
+  requests: number;
+}
+
 /**
- * Compacts a transcript by asking Jev, for every tool call outside the pinned
- * first and newest messages, whether the call and whether its result must
- * stay. The whole history (results omitted, fitted into `maxStateTokens`) is
- * sent as state with every batch of questions. Throws when Jev fails or the
- * history cannot be fitted; the caller decides whether to fall back.
+ * Asks the classifier, for every tool call outside the pinned first and
+ * newest messages, whether the call and whether its result must stay. The
+ * whole history (results omitted, fitted into `maxStateTokens`) is sent as
+ * state with every batch of questions. Failed batches are collected, not
+ * thrown; a history that cannot be fitted throws.
+ */
+export async function classifyCalls(
+  messages: readonly Message[],
+  asker: JevAsker,
+  options: CompactOptions = {},
+): Promise<Classification> {
+  const resolved = resolveOptions(options);
+  const calls = collectToolCalls(messages, resolved.preserveRecentMessages);
+  const candidates = calls.filter((call) => !call.pinned);
+  const classification: Classification = {
+    answers: new Map(),
+    failures: [],
+    timedOut: false,
+    candidates: candidates.length,
+    stateTokens: 0,
+    stateStage: '',
+    requests: 0,
+  };
+  if (candidates.length === 0) return classification;
+  const state = fitState(messages, calls, resolved);
+  classification.stateTokens = state.tokens;
+  classification.stateStage = state.stage;
+  const batches = batchCalls(candidates, state.tokens, resolved);
+  classification.requests = batches.length;
+  const settled = await Promise.allSettled(
+    batches.map((batch) => askBatch(asker, state.state, batch)),
+  );
+  settled.forEach((outcome, index) => {
+    let map: Map<string, CallAnswer> | undefined;
+    if (outcome.status === 'fulfilled') map = outcome.value;
+    else {
+      const reason: unknown = outcome.reason;
+      if (reason instanceof PartialAnswersError) {
+        map = partialAnswers(batches[index]!, reason.answers);
+        if (reason.timedOut) classification.timedOut = true;
+        else classification.failures.push(reason);
+      } else classification.failures.push(reason);
+    }
+    for (const [id, answer] of map ?? []) classification.answers.set(id, answer);
+  });
+  return classification;
+}
+
+/**
+ * Applies answers (by `tool_use_id`) to a transcript: every call without an
+ * answer keeps its default of 1, so nothing is dropped without a judgment.
+ * The answers may come from an earlier classification of a transcript this
+ * one extends; pinning is decided on this one.
+ */
+export function compactWithAnswers(
+  messages: readonly Message[],
+  classification: Pick<Classification, 'answers'> & Partial<Classification>,
+  options: CompactOptions = {},
+  started: number = Date.now(),
+): CompactResult {
+  const resolved = resolveOptions(options);
+  const calls = collectToolCalls(messages, resolved.preserveRecentMessages);
+  const decisions = calls.map((call) =>
+    decideCall(
+      call,
+      classification.answers.get(call.tool_use_id) ?? { keepCall: 1, keepResult: 1 },
+      resolved,
+    ),
+  );
+  const kept = applyDecisions(messages, decisions, calls, resolved.truncateHeadChars);
+  return {
+    messages: kept,
+    decisions,
+    stats: {
+      messagesBefore: messages.length,
+      messagesAfter: kept.length,
+      charsBefore: messages.reduce((sum, message) => sum + messageChars(message), 0),
+      charsAfter: kept.reduce((sum, message) => sum + messageChars(message), 0),
+      calls: calls.length,
+      kept: count(decisions, 'kept'),
+      resultsDropped: count(decisions, 'result_dropped'),
+      callsDropped: count(decisions, 'call_dropped'),
+      pinned: count(decisions, 'pinned'),
+      stateTokens: classification.stateTokens ?? 0,
+      stateStage: classification.stateStage ?? '',
+      requests: classification.requests ?? 0,
+      ms: Date.now() - started,
+    },
+  };
+}
+
+/**
+ * Compacts a transcript: `classifyCalls`, then `compactWithAnswers`. Throws
+ * when the history cannot be fitted; when a request fails the error is a
+ * `PartialCompactionError` whose `result` applies the answers that did come
+ * back. An asker that stops at its deadline is not a failure: the calls it
+ * did not reach are kept.
  */
 export async function compact(
   messages: readonly Message[],
@@ -260,50 +402,14 @@ export async function compact(
   options: CompactOptions = {},
 ): Promise<CompactResult> {
   const started = Date.now();
-  const resolved = resolveOptions(options);
-  const calls = collectToolCalls(messages, resolved.preserveRecentMessages);
-  const candidates = calls.filter((call) => !call.pinned);
-  const charsBefore = messages.reduce((sum, message) => sum + messageChars(message), 0);
-
-  let fitted: { tokens: number; stage: string } = { tokens: 0, stage: '' };
-  let batches: ToolCall[][] = [];
-  const answers = new Map<string, CallAnswer>();
-  if (candidates.length > 0) {
-    const state = fitState(messages, calls, resolved);
-    fitted = state;
-    batches = batchCalls(candidates, state.tokens, resolved);
-    const answered = await Promise.all(
-      batches.map((batch) => askBatch(asker, state.state, batch)),
+  const classification = await classifyCalls(messages, asker, options);
+  const result = compactWithAnswers(messages, classification, options, started);
+  const [first] = classification.failures;
+  if (classification.failures.length > 0) {
+    throw new PartialCompactionError(
+      `${first instanceof Error ? first.message : String(first)} (${classification.answers.size}/${classification.candidates} calls decided)`,
+      result,
     );
-    for (const map of answered) for (const [id, answer] of map) answers.set(id, answer);
   }
-
-  const decisions = calls.map((call) =>
-    decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, resolved),
-  );
-  const kept = applyDecisions(
-    messages,
-    decisions,
-    calls,
-    resolved.truncateHeadChars,
-  );
-  return {
-    messages: kept,
-    decisions,
-    stats: {
-      messagesBefore: messages.length,
-      messagesAfter: kept.length,
-      charsBefore,
-      charsAfter: kept.reduce((sum, message) => sum + messageChars(message), 0),
-      calls: calls.length,
-      kept: count(decisions, 'kept'),
-      resultsDropped: count(decisions, 'result_dropped'),
-      callsDropped: count(decisions, 'call_dropped'),
-      pinned: count(decisions, 'pinned'),
-      stateTokens: fitted.tokens,
-      stateStage: fitted.stage,
-      requests: batches.length,
-      ms: Date.now() - started,
-    },
-  };
+  return result;
 }

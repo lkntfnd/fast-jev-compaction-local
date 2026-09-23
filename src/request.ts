@@ -62,6 +62,19 @@ export function parseJevResponse(
   return parsed as JevResponse;
 }
 
+/** A failed `ask` that still carries the answers it got before failing. */
+export class PartialAnswersError extends Error {
+  constructor(
+    message: string,
+    readonly answers: Record<string, JevAnswer>,
+    /** True when the asker stopped at its deadline rather than on an error. */
+    readonly timedOut: boolean = false,
+  ) {
+    super(message);
+    this.name = 'PartialAnswersError';
+  }
+}
+
 /** The `noul` probability of one answer; throws when it is not there. */
 export function noulAnswer(
   answers: Record<string, JevAnswer>,
