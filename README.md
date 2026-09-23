@@ -1,9 +1,9 @@
-# fast-jev-compaction
+# Local implementation of "fast-jev-compaction" plugin.
 
-Claude Code plugin that replaces the compaction summary with Jev decisions:
-every tool call and result is scored in one fast request, stale ones are
-dropped or truncated, everything kept stays verbatim. Also usable as an npm
-library.
+Claude Code plugin that replaces the compaction summary with locally hosted
+system-one model via LM-Studio / python server. Current best-fit model is a 
+[qwen3.5 ]. A good job was made by making Qwen3.5 llm answer in system-one style.
+(https://huggingface.co/chaoliangUNSW/Jev-Style-Qwen3.5-2B-Decision-MLX-bf16)
 
 ## What and why
 
